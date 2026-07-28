@@ -18,14 +18,19 @@
 # new credentials.
 #
 # Usage:
-#   rotate              # Next account
+#   rotate              # Next account, leaving running sessions alone
 #   rotate <email>      # Specific account
 #   rotate --status     # Show current
+#   rotate --restart    # Also exit and resume every Claude pane so running
+#                         sessions pick up the new account. Without this the
+#                         credentials are swapped but any Claude already
+#                         running keeps using the old account until you
+#                         restart it yourself.
 #   rotate --dry-run    # Simulate a rotation without touching the keychain,
 #                         state file, tokens, or any pane. Read-only paths
 #                         (pane mapping, candidate selection, token lookup)
 #                         still run so you can verify the plumbing. Can be
-#                         combined with <email>.
+#                         combined with <email> and --restart.
 #
 # Environment:
 #   SUPERPOWERD_ROTATE_GRACE  Seconds to wait between the pane mapping step
@@ -51,16 +56,17 @@ if ! [[ "$GRACE_SECONDS" =~ ^[0-9]+$ ]]; then
   GRACE_SECONDS=10
 fi
 
-# Strip --dry-run out of the argument list so the rest of the script can
-# keep treating $1 as the optional target email or --status flag.
+# Strip flags out of the argument list so the rest of the script can keep
+# treating $1 as the optional target email or --status flag.
 DRY_RUN=false
+RESTART=false
 NEW_ARGS=()
 for arg in "$@"; do
-  if [[ "$arg" == "--dry-run" ]]; then
-    DRY_RUN=true
-  else
-    NEW_ARGS+=("$arg")
-  fi
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --restart) RESTART=true ;;
+    *)         NEW_ARGS+=("$arg") ;;
+  esac
 done
 set -- "${NEW_ARGS[@]+"${NEW_ARGS[@]}"}"
 
@@ -400,9 +406,10 @@ fi
 log "=== Rotating: $CURRENT_EMAIL -> $NEXT_EMAIL ==="
 if $DRY_RUN; then
   log "(dry-run: no side effects will be performed)"
-elif [ "$GRACE_SECONDS" -eq 0 ]; then
+elif ! $RESTART || [ "$GRACE_SECONDS" -eq 0 ]; then
   # Fire the immediate notification only when there's no grace period to
-  # avoid stacking two banners a couple of seconds apart.
+  # avoid stacking two banners a couple of seconds apart. Without --restart
+  # there is never a grace period, since nothing gets torn down.
   notify "Rotating to $NEXT_EMAIL..."
 fi
 
@@ -411,7 +418,14 @@ log "Step 1: Saving current tokens"
 if $DRY_RUN; then
   log "  would run: tokens.js capture ($CURRENT_EMAIL)"
 else
-  node "$SCRIPT_DIR/tokens.js" capture 2>&1 | while read -r line; do log "  $line"; done
+  # A refused capture means the credentials and account record have drifted.
+  # Rotating from that state would swap in tokens whose owner we can't trust,
+  # so stop here rather than compound the mess.
+  if ! node "$SCRIPT_DIR/tokens.js" capture 2>&1 | while read -r line; do log "  $line"; done; then
+    log "ERROR: could not save current tokens — aborting before any swap."
+    log "       Resync with 'claude auth login', then re-run rotation."
+    exit 1
+  fi
   curl -s "http://localhost:3848/api/claude-usage" > /dev/null 2>&1 || true
 fi
 
@@ -446,7 +460,10 @@ fi
 # before the keychain swap so Ctrl-C during the sleep aborts with zero
 # side effects (the EXIT trap releases the lock, tokens/state/keychain
 # are all untouched).
-if [ "$GRACE_SECONDS" -gt 0 ]; then
+# Only meaningful with --restart: the whole point of the delay is to give
+# warning before panes are torn down. A credentials-only swap destroys
+# nothing, so there's nothing to warn about and no reason to wait.
+if $RESTART && [ "$GRACE_SECONDS" -gt 0 ]; then
   GRACE_MSG="Rotating to $NEXT_EMAIL in ${GRACE_SECONDS}s"
   if [ "$PANE_COUNT" -gt 0 ]; then
     GRACE_MSG="$GRACE_MSG — $PANE_COUNT pane(s) will restart"
@@ -489,6 +506,33 @@ if $DRY_RUN; then
   log "  would update state: current=$NEXT_INDEX email=$NEXT_EMAIL"
 else
   update_state "$NEXT_INDEX" "$NEXT_EMAIL"
+fi
+
+# Steps 5-7 tear down and resume every Claude pane. That's opt-in: without
+# --restart the rotation stops here, having swapped credentials only, and
+# running sessions keep the old account until restarted by hand.
+if ! $RESTART; then
+  rm -f "$PANE_MAP"
+  if $DRY_RUN; then
+    log "=== Dry run complete: would switch to $NEXT_EMAIL ==="
+    echo ""
+    echo "[DRY-RUN] Would switch to: $NEXT_EMAIL"
+    echo "[DRY-RUN] Would leave $PANE_COUNT running agent(s) untouched."
+    echo "[DRY-RUN] Pass --restart to also resume them on the new account."
+    echo "[DRY-RUN] No changes made to keychain, state, tokens, or panes."
+  else
+    log "=== Now using: $NEXT_EMAIL (panes left running) ==="
+    notify "Now using $NEXT_EMAIL"
+    echo ""
+    echo "Switched to: $NEXT_EMAIL"
+    if [ "$PANE_COUNT" -gt 0 ]; then
+      echo ""
+      echo "$PANE_COUNT running agent(s) still on the old account."
+      echo "New sessions use $NEXT_EMAIL. To move the running ones too:"
+      echo "  restart them yourself, or re-run with --restart next time."
+    fi
+  fi
+  exit 0
 fi
 
 # Step 5: Kill and restart each pane with its exact session ID

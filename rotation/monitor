@@ -71,7 +71,10 @@ should_rotate() {
 do_rotate() {
   LAST_ROTATION=$(date +%s)
   log "!!! Rate limit detected — rotating"
-  "$SCRIPT_DIR/rotate" 2>&1 | while read -r line; do log "  [rotate] $line"; done
+  # --restart is required here: the sessions that just hit the limit are the
+  # ones that need to come back on the new account. A credentials-only swap
+  # would leave them stuck exactly where they stalled.
+  "$SCRIPT_DIR/rotate" --restart 2>&1 | while read -r line; do log "  [rotate] $line"; done
   log "Cooldown: ${COOLDOWN}s"
 }
 
