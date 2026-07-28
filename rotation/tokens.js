@@ -19,6 +19,12 @@ const TOKENS_FILE = path.join(DATA_DIR, "tokens.json");
 // throwaway keychain entry — production always uses "Claude Code-credentials".
 const KEYCHAIN_SERVICE = process.env.SUPERPOWERD_KEYCHAIN_SERVICE || "Claude Code-credentials";
 
+// macOS keeps credentials in the login keychain; Linux/WSL keeps them in a
+// 0600 JSON file. Override the path with SUPERPOWERD_CREDENTIALS_FILE.
+const IS_DARWIN = process.platform === "darwin";
+const CREDENTIALS_FILE = process.env.SUPERPOWERD_CREDENTIALS_FILE
+  || path.join(os.homedir(), ".claude", ".credentials.json");
+
 function log(message) {
   console.log("[" + new Date().toISOString() + "] " + message);
 }
@@ -39,6 +45,9 @@ function writeTokenStore(store) {
 
 function readKeychain() {
   try {
+    if (!IS_DARWIN) {
+      return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf8"));
+    }
     const password = execFileSync(
       "security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
       { encoding: "utf8", timeout: 5000 }
@@ -51,6 +60,15 @@ function readKeychain() {
 
 function writeKeychain(data, account) {
   const json = JSON.stringify(data);
+  if (!IS_DARWIN) {
+    // Write via a 0600 temp file + rename so a crash can't leave Claude Code
+    // with a half-written credentials file.
+    const tmp = CREDENTIALS_FILE + ".superpowerd.tmp";
+    fs.mkdirSync(path.dirname(CREDENTIALS_FILE), { recursive: true });
+    fs.writeFileSync(tmp, json, { mode: 0o600 });
+    fs.renameSync(tmp, CREDENTIALS_FILE);
+    return;
+  }
   execFileSync("security", [
     "add-generic-password", "-U",
     "-s", KEYCHAIN_SERVICE,
@@ -60,6 +78,8 @@ function writeKeychain(data, account) {
 }
 
 function getKeychainAccount() {
+  // Only meaningful on macOS, where the keychain entry carries an account name.
+  if (!IS_DARWIN) return null;
   try {
     const output = execFileSync(
       "security", ["find-generic-password", "-s", KEYCHAIN_SERVICE],
@@ -129,6 +149,7 @@ async function capture() {
     accessToken: credentials.claudeAiOauth.accessToken,
     refreshToken: credentials.claudeAiOauth.refreshToken,
     expiresAt: credentials.claudeAiOauth.expiresAt,
+    refreshTokenExpiresAt: credentials.claudeAiOauth.refreshTokenExpiresAt,
     scopes: credentials.claudeAiOauth.scopes,
     subscriptionType: credentials.claudeAiOauth.subscriptionType,
     rateLimitTier: credentials.claudeAiOauth.rateLimitTier,
@@ -205,6 +226,11 @@ async function swap(email) {
     subscriptionType: store[email].subscriptionType,
     rateLimitTier: store[email].rateLimitTier,
   };
+  // Only carry this over when captured — omitting it entirely is safer than
+  // writing an undefined that JSON.stringify would drop anyway.
+  if (store[email].refreshTokenExpiresAt !== undefined) {
+    credentials.claudeAiOauth.refreshTokenExpiresAt = store[email].refreshTokenExpiresAt;
+  }
 
   const account = getKeychainAccount();
   writeKeychain(credentials, account);
