@@ -25,6 +25,13 @@ const IS_DARWIN = process.platform === "darwin";
 const CREDENTIALS_FILE = process.env.SUPERPOWERD_CREDENTIALS_FILE
   || path.join(os.homedir(), ".claude", ".credentials.json");
 
+// Identity lives separately from the tokens: ~/.claude.json carries the
+// oauthAccount record (email, org) that `claude auth status` reports. Swapping
+// tokens without swapping this leaves the CLI insisting it's still the old
+// account, and any later capture files the new token under the old email.
+const CLAUDE_CONFIG_FILE = process.env.SUPERPOWERD_CLAUDE_CONFIG
+  || path.join(os.homedir(), ".claude.json");
+
 function log(message) {
   console.log("[" + new Date().toISOString() + "] " + message);
 }
@@ -92,6 +99,28 @@ function getKeychainAccount() {
   }
 }
 
+function readAccountRecord() {
+  try {
+    const config = JSON.parse(fs.readFileSync(CLAUDE_CONFIG_FILE, "utf8"));
+    return config.oauthAccount || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAccountRecord(account) {
+  // ~/.claude.json holds far more than identity (project state, history), so
+  // rewrite only oauthAccount and preserve everything else. Atomic rename, and
+  // keep the file's existing mode rather than assuming one.
+  const raw = fs.readFileSync(CLAUDE_CONFIG_FILE, "utf8");
+  const config = JSON.parse(raw);
+  config.oauthAccount = account;
+  const mode = fs.statSync(CLAUDE_CONFIG_FILE).mode & 0o777;
+  const tmp = CLAUDE_CONFIG_FILE + ".superpowerd.tmp";
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode });
+  fs.renameSync(tmp, CLAUDE_CONFIG_FILE);
+}
+
 function getCurrentEmail() {
   try {
     const result = execFileSync("claude", ["auth", "status"], { encoding: "utf8", timeout: 5000 });
@@ -144,8 +173,22 @@ async function capture() {
     } catch {}
   }
 
+  // The token comes from the credentials file and the email from the config
+  // file. If those two have drifted apart, pairing them files a token under
+  // the wrong account and silently corrupts the store — refuse instead.
+  const account = readAccountRecord();
+  if (account && orgId && account.organizationUuid && account.organizationUuid !== orgId) {
+    console.error("Refusing to capture: credentials and " + CLAUDE_CONFIG_FILE + " disagree.");
+    console.error("  token belongs to org : " + orgId);
+    console.error("  config claims account: " + account.emailAddress + " (org " + account.organizationUuid + ")");
+    console.error("Run `claude auth login` to resync them, then capture again.");
+    process.exit(1);
+  }
+
   const store = readTokenStore();
   store[email] = {
+    // Identity travels with the tokens so swap() can restore both together.
+    oauthAccount: account,
     accessToken: credentials.claudeAiOauth.accessToken,
     refreshToken: credentials.claudeAiOauth.refreshToken,
     expiresAt: credentials.claudeAiOauth.expiresAt,
@@ -232,9 +275,20 @@ async function swap(email) {
     credentials.claudeAiOauth.refreshTokenExpiresAt = store[email].refreshTokenExpiresAt;
   }
 
-  const account = getKeychainAccount();
-  writeKeychain(credentials, account);
-  log("Swapped keychain to " + email);
+  const keychainAccount = getKeychainAccount();
+  writeKeychain(credentials, keychainAccount);
+
+  // Identity must move with the tokens, or `claude auth status` keeps naming
+  // the old account and the next capture misfiles the token under it.
+  if (store[email].oauthAccount) {
+    writeAccountRecord(store[email].oauthAccount);
+    log("Swapped credentials and account record to " + email);
+  } else {
+    log("Swapped credentials to " + email);
+    log("WARNING: no stored account record for " + email + " — `claude auth status`");
+    log("         will still report the previous account. Re-run capture for this");
+    log("         account after `claude auth login` to record its identity.");
+  }
 }
 
 async function list() {
@@ -253,6 +307,17 @@ async function list() {
       console.log("  [-] " + email + " (not captured)" + active);
     }
   }
+
+  // Captured accounts missing from accounts.conf would otherwise be invisible
+  // here and skipped by rotation, which reads the same list.
+  const orphans = Object.keys(store).filter((email) => !accounts.includes(email));
+  for (const email of orphans) {
+    const active = email === current ? " <-- active" : "";
+    console.log("  [!] " + email + " (captured, but not in accounts.conf)" + active);
+  }
+  if (orphans.length > 0) {
+    console.log("\n  Add the [!] account(s) to accounts.conf to include them in rotation.");
+  }
   console.log("");
 }
 
@@ -265,6 +330,21 @@ async function status() {
   const email = getCurrentEmail();
   const expires = new Date(credentials.claudeAiOauth.expiresAt);
   const remaining = Math.floor((expires.getTime() - Date.now()) / 60000);
+
+  // Cross-check the token's real owner against the identity the CLI reports.
+  const account = readAccountRecord();
+  const store = readTokenStore();
+  const owner = Object.keys(store).find(
+    (e) => store[e].accessToken === credentials.claudeAiOauth.accessToken
+  );
+  if (account && owner && account.emailAddress !== owner) {
+    console.log("WARNING: credentials and account record disagree.");
+    console.log("  token matches stored account: " + owner);
+    console.log("  but config reports          : " + account.emailAddress);
+    console.log("  Run `claude auth login` to resync before capturing again.");
+    console.log("");
+  }
+
   console.log("Keychain account: " + (email || "unknown"));
   console.log("Token expires: " + expires.toISOString() + " (" + remaining + " min)");
   console.log("Subscription: " + credentials.claudeAiOauth.subscriptionType);
