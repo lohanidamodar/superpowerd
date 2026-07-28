@@ -1,10 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Bootstrap superpowerd on a fresh macOS machine.
+# Bootstrap superpowerd on a fresh macOS or Linux machine.
 #
-# Installs: Homebrew, git, gh, Claude Code, WezTerm, skhd
+# Installs: git, gh, Claude Code, tmux (plus Homebrew/WezTerm/skhd on macOS)
 # Configures: WezTerm grid, pane titles, account rotation, dashboard
+#
+# For a rotation-only install with no package manager, dashboard, or window
+# manager, use setup-minimal.sh instead.
 #
 # Usage:
 #   bash setup.sh
@@ -13,22 +16,78 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOME_DIR="$HOME"
 WORKSPACE="${SUPERPOWERD_WORKSPACE:-$HOME/Local}"
 
+IS_DARWIN=false
+[[ "$(uname)" == "Darwin" ]] && IS_DARWIN=true
+
 echo ""
-echo "  superpowerd setup"
+echo "  superpowerd setup ($(uname))"
 echo ""
 
-# Install Homebrew
-echo "==> Homebrew"
-if ! command -v brew &>/dev/null; then
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  eval "$(/opt/homebrew/bin/brew shellenv)"
+# sed -i takes a mandatory backup suffix on BSD/macOS and an optional one on
+# GNU. Passing '' to GNU sed makes it read '' as a filename and fail the script.
+sed_inplace() {
+  if $IS_DARWIN; then sed -i '' "$@"; else sed -i "$@"; fi
+}
+
+if $IS_DARWIN; then
+  echo "==> Homebrew"
+  if ! command -v brew &>/dev/null; then
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  fi
+
+  echo "==> Packages"
+  brew install --quiet git gh node tmux mosh 2>/dev/null || true
+  brew install --cask --quiet wezterm 2>/dev/null || true
+  brew install --cask --quiet font-fira-code-nerd-font 2>/dev/null || true
+  brew install --quiet koekeishiya/formulae/skhd 2>/dev/null || true
+else
+  # No Homebrew on Linux: install only what's actually missing, via whichever
+  # package manager exists. WezTerm and the Nerd Font are left to the user —
+  # they're desktop apps and rotation drives tmux perfectly well without them.
+  echo "==> Packages"
+  SUDO=""
+  [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null && SUDO="sudo"
+
+  missing=()
+  for tool in git gh node tmux; do
+    command -v "$tool" &>/dev/null || missing+=("$tool")
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    echo "    All present: git gh node tmux"
+  else
+    echo "    Missing: ${missing[*]}"
+    # Package names differ from command names on some distros.
+    pkgs=()
+    for tool in "${missing[@]}"; do
+      case "$tool" in
+        node) pkgs+=("nodejs") ;;
+        *)    pkgs+=("$tool") ;;
+      esac
+    done
+
+    if command -v apt-get &>/dev/null; then
+      $SUDO apt-get update -qq 2>/dev/null || true
+      $SUDO apt-get install -y "${pkgs[@]}" 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+      $SUDO dnf install -y "${pkgs[@]}" 2>/dev/null || true
+    elif command -v pacman &>/dev/null; then
+      $SUDO pacman -S --needed --noconfirm "${pkgs[@]}" 2>/dev/null || true
+    elif command -v zypper &>/dev/null; then
+      $SUDO zypper install -y "${pkgs[@]}" 2>/dev/null || true
+    elif command -v apk &>/dev/null; then
+      $SUDO apk add "${pkgs[@]}" 2>/dev/null || true
+    else
+      echo "    No supported package manager found — install manually: ${pkgs[*]}"
+    fi
+
+    # gh in particular is absent from many default repos; don't fail silently.
+    for tool in "${missing[@]}"; do
+      command -v "$tool" &>/dev/null || echo "    WARNING: $tool still missing — install it manually"
+    done
+  fi
 fi
-
-echo "==> Packages"
-brew install --quiet git gh node tmux mosh 2>/dev/null || true
-brew install --cask --quiet wezterm 2>/dev/null || true
-brew install --cask --quiet font-fira-code-nerd-font 2>/dev/null || true
-brew install --quiet koekeishiya/formulae/skhd 2>/dev/null || true
 
 echo "==> Claude Code"
 if ! command -v claude &>/dev/null; then
@@ -89,11 +148,13 @@ echo "==> Shell hooks"
 mkdir -p "$HOME/.config/iterm2"
 cp "$PROJECT_DIR/wezterm/pane-title.zsh" "$HOME/.config/iterm2/pane-title.zsh"
 
-# skhd
-echo "==> skhd"
-mkdir -p "$HOME/.config/skhd"
-skhd --install-service 2>/dev/null || true
-skhd --restart-service 2>/dev/null || true
+# skhd (macOS-only hotkey daemon; Linux users bind the same actions in their WM)
+if $IS_DARWIN; then
+  echo "==> skhd"
+  mkdir -p "$HOME/.config/skhd"
+  skhd --install-service 2>/dev/null || true
+  skhd --restart-service 2>/dev/null || true
+fi
 
 # .zshrc modifications
 echo "==> Shell config"
@@ -101,7 +162,7 @@ ZSHRC="$HOME/.zshrc"
 touch "$ZSHRC"
 
 if grep -q '# DISABLE_AUTO_TITLE="true"' "$ZSHRC"; then
-  sed -i '' 's/# DISABLE_AUTO_TITLE="true"/DISABLE_AUTO_TITLE="true"/' "$ZSHRC"
+  sed_inplace 's/# DISABLE_AUTO_TITLE="true"/DISABLE_AUTO_TITLE="true"/' "$ZSHRC"
 elif ! grep -q 'DISABLE_AUTO_TITLE="true"' "$ZSHRC"; then
   echo 'DISABLE_AUTO_TITLE="true"' >> "$ZSHRC"
 fi
@@ -202,7 +263,7 @@ fi
 # Install persistent monitor
 echo "==> Monitor service"
 NODE_PATH=$(which node)
-if [[ "$(uname)" == "Darwin" ]]; then
+if $IS_DARWIN; then
   PLIST="$HOME/Library/LaunchAgents/com.superpowerd.monitor.plist"
   cat > "$PLIST" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -259,7 +320,7 @@ fi
 # Dashboard service
 NPX_PATH=$(which npx)
 echo "==> Dashboard service"
-if [[ "$(uname)" == "Darwin" ]]; then
+if $IS_DARWIN; then
   DASH_PLIST="$HOME/Library/LaunchAgents/com.superpowerd.dashboard.plist"
   cat > "$DASH_PLIST" << DASHPLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -332,17 +393,37 @@ echo "  sp-monitor --status   Check monitor"
 echo "  sp-session <name>     Attach to a tmux session"
 echo "  sp-list               List all tmux sessions"
 echo ""
-echo "Shortcuts (in WezTerm):"
-echo "  Opt+Cmd+\`   Toggle WezTerm"
-echo "  Opt+Cmd+P   Open PR in browser"
-echo "  Opt+Cmd+N   Create PR"
-echo "  Opt+Cmd+R   Restart Claude"
-echo ""
-echo "Remote access:"
-echo "  1. Enable Remote Login: System Settings > General > Sharing > Remote Login"
-echo "  2. Install Tailscale on this Mac and your phone: https://tailscale.com"
-echo "  3. SSH in: ssh $(whoami)@\$(hostname).tail-net-name.ts.net"
-echo "  4. Use sp-list to see sessions, sp-session <name> to attach"
-echo "  5. For mobile: Blink Shell (iOS) or Termux (Android)"
-echo ""
-echo "Next: Open WezTerm (or restart it) to activate the pane grid."
+if $IS_DARWIN; then
+  echo "Shortcuts (in WezTerm, via skhd):"
+  echo "  Opt+Cmd+\`   Toggle WezTerm"
+  echo "  Opt+Cmd+P   Open PR in browser"
+  echo "  Opt+Cmd+N   Create PR"
+  echo "  Opt+Cmd+R   Restart Claude"
+  echo ""
+  echo "Remote access:"
+  echo "  1. Enable Remote Login: System Settings > General > Sharing > Remote Login"
+  echo "  2. Install Tailscale on this Mac and your phone: https://tailscale.com"
+  echo "  3. SSH in: ssh $(whoami)@\$(hostname).tail-net-name.ts.net"
+  echo "  4. Use sp-list to see sessions, sp-session <name> to attach"
+  echo "  5. For mobile: Blink Shell (iOS) or Termux (Android)"
+  echo ""
+  echo "Next: Open WezTerm (or restart it) to activate the pane grid."
+else
+  echo "Shortcuts:"
+  echo "  skhd is macOS-only. Bind the equivalents in your window manager,"
+  echo "  or drive panes directly through tmux."
+  echo ""
+  echo "Services:"
+  echo "  systemctl --user status superpowerd-monitor"
+  echo "  systemctl --user status superpowerd-dashboard"
+  echo "  User services stop at logout unless lingering is enabled:"
+  echo "    sudo loginctl enable-linger $(whoami)"
+  echo ""
+  echo "Remote access:"
+  echo "  1. Install Tailscale: https://tailscale.com/download/linux"
+  echo "  2. SSH in: ssh $(whoami)@\$(hostname).tail-net-name.ts.net"
+  echo "  3. Use sp-list to see sessions, sp-session <name> to attach"
+  echo "  4. For mobile: Blink Shell (iOS) or Termux (Android)"
+  echo ""
+  echo "Next: restart your shell to pick up the sp-* aliases."
+fi
